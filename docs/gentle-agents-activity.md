@@ -100,6 +100,13 @@ and are recomputed when rendered so theme changes do not leave stale colors.
 Consultation is not an owner reply; queued messages are not read or delivery
 receipts. Complete model-facing output and permissions remain unchanged.
 
+Failed `orchestrator_send_message` sends retain `Error: session message was not accepted.`
+and `details.error: "not accepted"`, adding only `details.reason`: a canonical
+`SessionPresenceError` code (`invalid_session`, `not_found`, `invalid_presence`,
+`unsafe_path`, `io_error`, or `busy`), otherwise `unknown`. Raw errors and session
+data are not included in this diagnostic. Consent, retries (none), and acceptance
+semantics are unchanged; this reason does not establish the transport failure's root cause.
+
 ### Publish curated state (Refs #1702; first slice)
 
 `orchestrator_session_id` also accepts optional `state`: strings named `objective`,

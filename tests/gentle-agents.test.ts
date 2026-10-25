@@ -17,7 +17,7 @@ import { visibleWidth, type Component, type TUI, type TuiMouseEvent } from "@ear
 import { sidebarState } from "../lib/shell-sidebar.ts";
 import { CHILD_PACKAGE_INJECTION_ENV, encodeChildPackageInjection } from "../lib/child-package-injection.ts";
 import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, agentResultPreview, answerThroughUi, childContextExtensionPaths, completionText, createDefaultSessionTransport, legacySubagentsInstalled, PARENT_WAKE_GRACE_MS, type AgentsDeps, type SessionTransportFactory } from "../extensions/gentle-agents.ts";
-import { ActiveSessionClient, ActiveSessionListener, SessionPresenceError, SessionPresenceRegistry, type PresenceRecord } from "../lib/agents-session-transport.ts";
+import { ActiveSessionClient, ActiveSessionClientError, ActiveSessionListener, SessionPresenceError, SessionPresenceRegistry, type PresenceRecord } from "../lib/agents-session-transport.ts";
 import { WindowsActiveSessionClient, WindowsActiveSessionListener } from "../lib/windows-session-transport.ts";
 import { historyDir, loadHistory, saveTask } from "../lib/agents-history.ts";
 import { STALE_COMPLETION_MS } from "../lib/agents-completion-delivery.ts";
@@ -5234,6 +5234,48 @@ test("all orchestrator tools own compact and expanded card rendering", () => {
 		assert.equal(typeof tool.renderCall, "function", name);
 		assert.equal(typeof tool.renderResult, "function", name);
 	}
+});
+
+test("orchestrator_send_message exposes only canonical presence reasons after one consented send failure", async t => {
+	const privateText = "private-error /secret/session token=hidden message-body";
+	const codes = ["invalid_session", "not_found", "invalid_presence", "unsafe_path", "io_error", "busy"] as const;
+	const cases: Array<{ name: string; error: unknown; reason: string }> = [
+		...codes.map(code => ({ name: code, error: new SessionPresenceError(code, privateText), reason: code })),
+		{ name: "untyped private error", error: new Error(privateText), reason: "unknown" },
+		{ name: "client error", error: new ActiveSessionClientError("not_found"), reason: "unknown" },
+		{ name: "unexpected runtime presence code", error: new SessionPresenceError(privateText as never, privateText), reason: "unknown" },
+		{ name: "lookalike presence error", error: { code: "busy", message: privateText }, reason: "unknown" },
+	];
+	for (const fixture of cases) await t.test(fixture.name, async () => {
+		const h = fakePi();
+		const runtime = deps();
+		const registry = { list: async () => [], listActivations: async () => [] };
+		const sent: unknown[] = [];
+		let closes = 0;
+		let starts = 0;
+		runtime.deps.sessionTransport = {
+			createRegistry: async () => registry,
+			createListener: () => ({ registry, start: async () => { starts++; }, close: async () => { closes++; } }),
+			createClient: () => ({ close: () => { closes++; }, sendNotification: async (...args: unknown[]) => { sent.push(args); throw fixture.error; } }),
+		} as never;
+		gentleAgents(h.pi, {}, runtime.deps);
+		const { ctx, dialogs } = fakeContext();
+		await h.fire("session_start", ctx);
+		try {
+			const result = await h.tools.get("orchestrator_send_message")!.execute("send", { recipient_session_id: "target-peer", message: "hello", reason: "status check" }, undefined, undefined, ctx);
+			assert.deepEqual(result.content, [{ type: "text", text: "Error: session message was not accepted." }]);
+			assert.deepEqual(result.details, { error: "not accepted", reason: fixture.reason });
+			assert.doesNotMatch(JSON.stringify(result), /private-error|secret|hidden|message-body/);
+			assert.deepEqual(dialogs, ["select:Authorize cross-orchestrator message to target-peer?\nReason: status check\nMessage: hello:Allow once|Allow for this session|Deny"]);
+			assert.equal(sent.length, 1, "no retries or extra sends");
+			assert.deepEqual(sent[0] && (sent[0] as unknown[]).slice(0, 2), ["target-peer", "hello"]);
+			assert.equal(starts, 1);
+			assert.equal(closes, 0, "failure does not replace or close the transport");
+			assert.equal(runtime.children.length, 0, "failure does not launch child work");
+		} finally {
+			await h.fire("session_shutdown", ctx);
+		}
+	});
 });
 
 // Issue #1364: user consent before cross-orchestrator communication

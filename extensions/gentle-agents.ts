@@ -2280,8 +2280,11 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			try {
 				const accepted = await transport.client.sendNotification(recipient, message, { signal, expectedActivation: activation, beforeConnect: () => activeTransportFor(ctx) === transport });
 				return activeTransportFor(ctx) === transport ? text(`Message ${accepted.id} from ${transport.sessionId} to ${recipient} accepted for delivery; it is not a delivery or read receipt.`, { gentleAgents: { messageId: accepted.id, senderSessionId: transport.sessionId, recipientSessionId: recipient, state: "accepted", message, reason, senderLabel: sanitizeDisplayLabel(ctx.sessionManager.getSessionName?.() ?? ""), recipientLabel: messagePeerLabel(agentHome, recipient) } }) : text("Error: session messaging is not ready.", { error: "stale" });
-			} catch {
-				return text("Error: session message was not accepted.", { error: "not accepted" });
+			} catch (error) {
+				// Check runtime values too: typed codes must never disclose arbitrary error content.
+				const code = error instanceof SessionPresenceError ? error.code : undefined;
+				const reason = code !== undefined && ["invalid_session", "not_found", "invalid_presence", "unsafe_path", "io_error", "busy"].includes(code) ? code : "unknown";
+				return text("Error: session message was not accepted.", { error: "not accepted", reason });
 			}
 		},
 	});
