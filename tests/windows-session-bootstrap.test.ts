@@ -8,7 +8,6 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { FIXED_WINDOWS_POWERSHELL, WindowsActiveSessionClient, WindowsActiveSessionListener, WindowsSessionPresenceRegistry, WindowsSessionRegistryPhaseSequence, type WindowsSessionRegistryPhaseEvent, parseWindowsHostFrame } from "../lib/windows-session-transport.ts";
-import { createDefaultSessionTransport } from "../extensions/gentle-agents.ts";
 import { ActiveSessionClientError, FrameDecoder, encodeNotificationFrame, type AckFrame } from "../lib/agents-session-transport.ts";
 import { decidePackedRunnerEntrypoint, deriveWindowsStartupTimingPathDelta, validateWindowsStartupTimingMachinePaths, WINDOWS_STARTUP_TIMING_WINDOWS_PATH_KEYS } from "../scripts/test-packed-runner.mjs";
 
@@ -1324,6 +1323,7 @@ test("Windows native listener setup closes the first acquired registry when the 
 });
 
 test("Windows default transport creates a registry without an observer", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {
+	const { createDefaultSessionTransport } = await import("../extensions/gentle-agents.ts");
 	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-observer-"));
 	const agentHome = join(root, "profile", "agent");
 	await mkdir(join(agentHome, "gentle-agents"), { recursive: true });
@@ -1336,6 +1336,7 @@ test("Windows default transport creates a registry without an observer", { skip:
 });
 
 test("Windows default transport emits fixed ordered phase events for its own registry", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {
+	const { createDefaultSessionTransport } = await import("../extensions/gentle-agents.ts");
 	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-observer-"));
 	const agentHome = join(root, "profile", "agent");
 	await mkdir(join(agentHome, "gentle-agents"), { recursive: true });
@@ -1363,6 +1364,7 @@ test("Windows default transport emits fixed ordered phase events for its own reg
 });
 
 test("Windows default transport rejects asynchronous observer setup without awaiting it", { skip: process.platform !== "win32", timeout: 20_000 }, async () => {
+	const { createDefaultSessionTransport } = await import("../extensions/gentle-agents.ts");
 	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-observer-"));
 	const agentHome = join(root, "profile", "agent");
 	await mkdir(join(agentHome, "gentle-agents"), { recursive: true });

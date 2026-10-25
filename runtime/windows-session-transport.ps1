@@ -334,12 +334,14 @@ public static class WindowsSessionBootstrap {
     return @"\??\" + volume.Substring(4);
   }
   // The helper keeps this capability local. Publication/list RPCs are intentionally absent.
-  static string[] EnumeratePinned(IntPtr directory) {
-    const int MaxEntries = 64, MaxBytes = 8192; const uint STATUS_NO_MORE_FILES = 0x80000006;
+  static string[] EnumeratePinned(IntPtr directory) { return EnumeratePinned(directory, 64, null); }
+  static string[] EnumeratePinned(IntPtr directory, int maxEntries, System.Diagnostics.Stopwatch clock) {
+    const int MaxBytes = 8192; const uint STATUS_NO_MORE_FILES = 0x80000006;
         int Header = Marshal.OffsetOf(typeof(FILE_ID_BOTH_DIR_HEADER), "FileName").ToInt32(); if (Header <= 0 || Header >= MaxBytes) Fail("unavailable"); var names = new List<string>(); IntPtr buffer = Marshal.AllocHGlobal(MaxBytes);
     try {
       bool restart = true;
       for (;;) {
+        CheckScanDeadline(clock);
         IO_STATUS_BLOCK io; uint status = NtQueryDirectoryFile(directory, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, out io, buffer, MaxBytes, FileIdBothDirectoryInformation, false, IntPtr.Zero, restart); restart = false;
         if (status == STATUS_NO_MORE_FILES) return names.ToArray();
             if (status != 0) Fail("unsafe");
@@ -352,7 +354,7 @@ public static class WindowsSessionBootstrap {
           if (recordLength < Header || recordLength > available - offset || (next != 0 && (next & 7) != 0) || nameLength < 0 || (nameLength & 1) != 0 || nameLength > recordLength - Header) Fail("unsafe");
           string name = Marshal.PtrToStringUni(IntPtr.Add(buffer, offset + Header), nameLength / 2);
           if (String.IsNullOrEmpty(name) || name.IndexOfAny(new char[] {'\\', '/', ':', '\0'}) >= 0) Fail("unsafe");
-          if (name != "." && name != "..") { if (names.Count >= MaxEntries) Fail("busy"); names.Add(name); }
+          if (name != "." && name != "..") { if (names.Count >= maxEntries) Fail("busy"); names.Add(name); }
               if (next == 0) { offset = available; } else { offset += next; }
         }
       }
@@ -438,8 +440,85 @@ public static class WindowsSessionBootstrap {
       }
       public static void Publish(string sessionId, string endpoint, long createdAt, byte[] descriptor, string sid) { PublishOwned(sessionId, endpoint, createdAt, descriptor, sid); }
           public static PresenceRecord[] List(string sid) { return List(null, sid); }
-      public static PresenceRecord[] List(string excluded, string sid) { lock (Gate) { RequirePresence(); if (excluded != null && !Regex.IsMatch(excluded, "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")) Fail("invalid"); var newest = new Dictionary<string, PresenceRecord>(StringComparer.Ordinal); foreach (string name in EnumeratePinned(Presence)) { IntPtr file = IntPtr.Zero; try { RecordIdentity ignoredIdentity; PresenceRecord record = ReadPinnedRecord(name, sid, out file, out ignoredIdentity); if (record.SessionId == excluded) continue; PresenceRecord prior; if (!newest.TryGetValue(record.SessionId, out prior) || record.CreatedAt > prior.CreatedAt || (record.CreatedAt == prior.CreatedAt && String.CompareOrdinal(record.Token, prior.Token) > 0)) newest[record.SessionId] = record; } catch (BootstrapFailure) { } finally { Close(file); } } var records = new List<PresenceRecord>(newest.Values); records.Sort(delegate(PresenceRecord left, PresenceRecord right) { return String.CompareOrdinal(left.SessionId, right.SessionId); }); return records.ToArray(); } }
-      public static PresenceRecord Resolve(string sessionId, string sid) { PresenceRecord[] records = List(null, sid); foreach (PresenceRecord record in records) if (record.SessionId == sessionId) return record; Fail("not_found"); return null; }
+      const int MaxScanEntries = 4096, ScanMilliseconds = 2000, MaxSnapshotBytes = 524288;
+      const int MaxSnapshots = 2, SnapshotMilliseconds = 2000, PageRecords = 32;
+      sealed class Snapshot {
+        public PresenceRecord[] Records; public int Offset; public string Excluded, Sid;
+        public readonly System.Diagnostics.Stopwatch Age = System.Diagnostics.Stopwatch.StartNew();
+      }
+      static readonly Dictionary<string, Snapshot> Snapshots = new Dictionary<string, Snapshot>(StringComparer.Ordinal);
+      static void CheckScanDeadline(System.Diagnostics.Stopwatch clock) {
+        if (clock != null && clock.ElapsedMilliseconds >= ScanMilliseconds) Fail("busy");
+      }
+      static PresenceRecord[] Scan(string excluded, string sid, bool complete) {
+        RequirePresence();
+        if (excluded != null && !Regex.IsMatch(excluded, "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")) Fail("invalid");
+        var clock = complete ? System.Diagnostics.Stopwatch.StartNew() : null;
+        var newest = new Dictionary<string, PresenceRecord>(StringComparer.Ordinal);
+        int snapshotBytes = 0;
+        foreach (string name in EnumeratePinned(Presence, complete ? MaxScanEntries : 64, clock)) {
+          CheckScanDeadline(clock);
+          IntPtr file = IntPtr.Zero;
+          PresenceRecord record = null;
+          try { RecordIdentity ignoredIdentity; record = ReadPinnedRecord(name, sid, out file, out ignoredIdentity); }
+          catch (BootstrapFailure) { }
+          finally { Close(file); }
+          CheckScanDeadline(clock);
+          if (record == null || record.SessionId == excluded) continue;
+          PresenceRecord prior;
+          if (!newest.TryGetValue(record.SessionId, out prior) || record.CreatedAt > prior.CreatedAt ||
+              (record.CreatedAt == prior.CreatedAt && String.CompareOrdinal(record.Token, prior.Token) > 0)) {
+            if (prior != null) snapshotBytes -= Encoding.UTF8.GetByteCount(RecordText(prior.SessionId, prior.Endpoint, prior.CreatedAt));
+            snapshotBytes += Encoding.UTF8.GetByteCount(RecordText(record.SessionId, record.Endpoint, record.CreatedAt));
+            if (complete && snapshotBytes > MaxSnapshotBytes) Fail("busy");
+            newest[record.SessionId] = record;
+          }
+        }
+        var records = new List<PresenceRecord>(newest.Values);
+        records.Sort(delegate(PresenceRecord left, PresenceRecord right) { return String.CompareOrdinal(left.SessionId, right.SessionId); });
+        CheckScanDeadline(clock);
+        return records.ToArray();
+      }
+      public static PresenceRecord[] List(string excluded, string sid) { lock (Gate) { return Scan(excluded, sid, false); } }
+      public static PresenceRecord Resolve(string sessionId, string sid) {
+        lock (Gate) {
+          foreach (PresenceRecord record in Scan(null, sid, true)) if (record.SessionId == sessionId) return record;
+          Fail("not_found"); return null;
+        }
+      }
+      public sealed class PresencePage {
+        public readonly PresenceRecord[] Records; public readonly string Cursor;
+        public PresencePage(PresenceRecord[] records, string cursor) { Records = records; Cursor = cursor; }
+      }
+      static readonly Timer SnapshotExpiry = new Timer(delegate(object ignored) { lock (Gate) { ExpireSnapshots(); } }, null, SnapshotMilliseconds, SnapshotMilliseconds);
+      static void ExpireSnapshots() {
+        foreach (string key in new List<string>(Snapshots.Keys))
+          if (Snapshots[key].Age.ElapsedMilliseconds >= SnapshotMilliseconds) Snapshots.Remove(key);
+      }
+      public static PresencePage ListPage(object cursorValue, object excludedValue, string sid) {
+        string cursor = (string)cursorValue, excluded = (string)excludedValue;
+        lock (Gate) {
+          RequirePresence(); ExpireSnapshots();
+          Snapshot snapshot;
+          if (cursor == null) {
+            if (Snapshots.Count >= MaxSnapshots) Fail("busy");
+            snapshot = new Snapshot(); snapshot.Records = Scan(excluded, sid, true);
+            snapshot.Excluded = excluded; snapshot.Sid = sid; snapshot.Age.Restart();
+          } else {
+            if (!Regex.IsMatch(cursor, "^[0-9a-f]{32}$") || !Snapshots.TryGetValue(cursor, out snapshot)) { Fail("invalid"); return null; }
+            if (snapshot.Excluded != excluded || snapshot.Sid != sid) Fail("invalid");
+            Snapshots.Remove(cursor); // Sequential, single-use capability; no caller-supplied offsets.
+          }
+          int count = Math.Min(PageRecords, snapshot.Records.Length - snapshot.Offset);
+          var records = new PresenceRecord[count]; Array.Copy(snapshot.Records, snapshot.Offset, records, 0, count);
+          snapshot.Offset += count;
+          string next = null;
+          if (snapshot.Offset < snapshot.Records.Length) {
+            next = Guid.NewGuid().ToString("N"); Snapshots.Add(next, snapshot);
+          }
+          return new PresencePage(records, next);
+        }
+      }
       static void RemoveOwnedPublication(OwnedPublication owned) {
         IntPtr current = IntPtr.Zero;
         try {
@@ -666,7 +745,7 @@ public static class WindowsSessionBootstrap {
           // Cleanup is best effort but always releases every retained publication handle before ancestors close.
           for (int index = OwnedPublications.Count - 1; index >= 0; index--) { OwnedPublication owned = OwnedPublications[index]; try { RemoveOwnedPublication(owned); } catch { if (OwnedPublications.Contains(owned)) OwnedPublications.Remove(owned); owned.Dispose(); } }
           for (int index = Handles.Count - 1; index >= 0; index--) Close(Handles[index]);
-          Handles.Clear(); OwnedPublications.Clear(); Presence = IntPtr.Zero;
+          Handles.Clear(); OwnedPublications.Clear(); Snapshots.Clear(); Presence = IntPtr.Zero;
         }
       }
 }
@@ -693,8 +772,11 @@ function Write-BootstrapRejectionDiagnostic([BootstrapFailure]$failure) {
 	[Console]::Error.WriteLine(([pscustomobject]@{ kind = 'windows-session-bootstrap-rejection'; stage = $stage; ntstatus = $ntstatus } | ConvertTo-Json -Compress))
 }
 
-function Write-Reply([string]$requestId, [bool]$ok, $result, [string]$error) {
+function Write-Reply([string]$requestId, [bool]$ok, $result, [string]$error, [bool]$bounded = $false) {
 	$line = if ($ok) { @{ requestId = $requestId; ok = $true; result = $result } | ConvertTo-Json -Compress -Depth 4 } else { @{ requestId = $requestId; ok = $false; error = $error } | ConvertTo-Json -Compress }
+	if ($bounded -and [Text.Encoding]::UTF8.GetByteCount($line) -gt $maxControlBytes) {
+		$line = @{ requestId = $requestId; ok = $false; error = 'busy' } | ConvertTo-Json -Compress
+	}
 	if ($nativeReady) { [WindowsSessionBootstrap]::WriteControl($line) } else { [Console]::Out.WriteLine($line) }
 }
 function Get-CurrentPrivateDescriptor {
@@ -779,6 +861,24 @@ try {
 			'record' { $createdAt = [int64]0; if (-not (Is-ExactRequest $request @('requestId', 'operation', 'sessionId', 'createdAt')) -or $request.sessionId -isnot [string] -or -not (Try-PresenceCreatedAt $request.createdAt ([ref]$createdAt))) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { Write-Reply $id $true (ConvertTo-PublicPresenceRecord ([WindowsSessionBootstrap]::NewRecord($request.sessionId, $createdAt))) $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
 			'publish' { $createdAt = [int64]0; if (-not (Is-ExactRequest $request @('requestId', 'operation', 'record')) -or -not (Is-PresenceRecord $request.record ([ref]$createdAt))) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { $identity = Get-CurrentPrivateDescriptor; [WindowsSessionBootstrap]::Publish($request.record.sessionId, $request.record.endpoint, $createdAt, $identity.Descriptor, $identity.Sid); Write-Reply $id $true @{ state = 'initialized'; bootstrap = 'complete' } $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
 			'list' { $hasExcludeSessionId = Is-ExactRequest $request @('requestId', 'operation', 'excludeSessionId'); if ($hasExcludeSessionId) { $excludeSessionId = $request.excludeSessionId; if ($excludeSessionId -isnot [string]) { Write-Reply $id $false $null 'invalid'; break requests } } elseif (-not (Is-ExactRequest $request @('requestId', 'operation'))) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { $identity = Get-CurrentPrivateDescriptor; $nativeRecords = if ($hasExcludeSessionId) { [WindowsSessionBootstrap]::List($excludeSessionId, $identity.Sid) } else { [WindowsSessionBootstrap]::List($identity.Sid) }; $records = @($nativeRecords | ForEach-Object { ConvertTo-PublicPresenceRecord $_ }); Write-Reply $id $true @{ records = $records } $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
+			'list-page' {
+				$hasExclude = Is-ExactRequest $request @('requestId', 'operation', 'cursor', 'excludeSessionId')
+				if ((-not $hasExclude -and -not (Is-ExactRequest $request @('requestId', 'operation', 'cursor'))) -or
+					($null -ne $request.cursor -and $request.cursor -isnot [string])) { Write-Reply $id $false $null 'invalid'; break requests }
+				$excluded = $null
+				if ($hasExclude) {
+					if ($request.excludeSessionId -isnot [string]) { Write-Reply $id $false $null 'invalid'; break requests }
+					$excluded = $request.excludeSessionId
+				}
+				if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }
+				try {
+					$identity = Get-CurrentPrivateDescriptor
+					$page = [WindowsSessionBootstrap]::ListPage($request.cursor, $excluded, $identity.Sid)
+					$records = @($page.Records | ForEach-Object { ConvertTo-PublicPresenceRecord $_ })
+					Write-Reply $id $true @{ records = $records; cursor = $page.Cursor } $null $true
+				} catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }
+				break
+			}
 			'resolve' { if (-not (Is-ExactRequest $request @('requestId', 'operation', 'sessionId')) -or $request.sessionId -isnot [string]) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { $identity = Get-CurrentPrivateDescriptor; Write-Reply $id $true (ConvertTo-PublicPresenceRecord ([WindowsSessionBootstrap]::Resolve($request.sessionId, $identity.Sid))) $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
 			'remove' { $createdAt = [int64]0; if (-not (Is-ExactRequest $request @('requestId', 'operation', 'record')) -or -not (Is-PresenceRecord $request.record ([ref]$createdAt))) { Write-Reply $id $false $null 'invalid'; break requests }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { $identity = Get-CurrentPrivateDescriptor; [WindowsSessionBootstrap]::RemoveOwn($request.record.sessionId, $request.record.endpoint, $createdAt, $identity.Sid); Write-Reply $id $true @{ state = 'initialized'; bootstrap = 'complete' } $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
 			'listen' { $createdAt = [int64]0; $hasGeneration = Is-ExactRequest $request @('requestId', 'operation', 'sessionId', 'createdAt', 'generation'); $legacy = Is-ExactRequest $request @('requestId', 'operation', 'sessionId', 'createdAt'); if ((-not $hasGeneration -and -not $legacy) -or $request.sessionId -isnot [string] -or -not (Try-PresenceCreatedAt $request.createdAt ([ref]$createdAt))) { Write-Reply $id $false $null 'invalid'; break requests }; $requestedGeneration = $null; if ($hasGeneration) { $generation = [int64]0; if (-not (Try-PresenceCreatedAt $request.generation ([ref]$generation)) -or $generation -lt 1 -or $generation -gt 2147483647) { Write-Reply $id $false $null 'invalid'; break requests }; $requestedGeneration = [Nullable[int]]([int]$generation) }; if (-not $nativeReady) { Write-Reply $id $false $null 'unavailable'; break }; try { $pipeIdentity = Get-CurrentPipeDescriptor; $presenceIdentity = Get-CurrentPrivateDescriptor; if ($pipeIdentity.Sid -ne $presenceIdentity.Sid) { throw [System.InvalidOperationException]::new() }; Write-Reply $id $true (ConvertTo-PublicPresenceRecord ([WindowsSessionBootstrap]::Listen($request.sessionId, $createdAt, $requestedGeneration, $pipeIdentity.Descriptor, $presenceIdentity.Descriptor, $pipeIdentity.Sid))) $null } catch [BootstrapFailure] { Write-Reply $id $false $null $_.Exception.Code } catch { Write-Reply $id $false $null 'unavailable' }; break }
