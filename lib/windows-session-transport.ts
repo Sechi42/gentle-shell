@@ -18,6 +18,13 @@ import {
 
 export const FIXED_WINDOWS_POWERSHELL = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const MAX_CONTROL_BYTES = 16_384;
+const PAGE_RECORDS = 32;
+const MAX_SNAPSHOT_RECORDS = 4_096;
+const MAX_SNAPSHOT_BYTES = 524_288;
+const MAX_LIST_PAGES = Math.ceil(MAX_SNAPSHOT_RECORDS / PAGE_RECORDS);
+const PAGE_CURSOR = /^[0-9a-f]{32}$/;
+const validPageCursor = (value: unknown): value is string => typeof value === "string" && value.length === 32 && PAGE_CURSOR.test(value);
+type PresencePage = Readonly<{ records: readonly PresenceRecord[]; cursor: string | null }>;
 // The native helper caps one raw pipe request at MaxPipeBytes = 65,536. Its event
 // carries that request as canonical base64, so this private envelope is bounded by
 // ceil(raw / 3) * 4 plus the largest fixed, ASCII-only control fields below.
@@ -35,7 +42,7 @@ const PIPE = /^\\\\\.\\pipe\\gentle-pi-[A-Za-z0-9-]{1,96}$/;
 const SESSION = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 type HostState = Readonly<{ state: "partial" }> | Readonly<{ state: "initialized"; bootstrap: "complete" }> | Readonly<{ state: "initialized"; bootstrap: "complete"; entries: number }>;
-type HostReply = Readonly<{ requestId: string; ok: boolean; result?: HostState | WindowsRecord | Readonly<{ records: readonly WindowsRecord[] }>; error?: "unavailable" | "unsafe" | "busy" | "not_found" | "invalid" }>;
+type HostReply = Readonly<{ requestId: string; ok: boolean; result?: HostState | WindowsRecord | Readonly<{ records: readonly WindowsRecord[] }> | PresencePage; error?: "unavailable" | "unsafe" | "busy" | "not_found" | "invalid" }>;
 type HostEvent = Readonly<{ event: "startup-marker"; marker: WindowsSessionStartupMarker }> | Readonly<{ event: "notification"; connectionId: string; generation: number; frame: NotificationFrame }> | Readonly<{ event: "listener-failed"; generation: number; error: "unavailable" }>;
 type Pending = { kind: "rpc" | "ack"; resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
 type WindowsHostFailureCallback = (generation: number) => void;
@@ -198,6 +205,7 @@ export function parseWindowsHostFrame(line: string): HostReply {
 			try {
 				if (Object.keys(result).length === 4) publicResult = validRecord(result);
 				else if (Object.keys(result).length === 1 && Array.isArray(result.records) && result.records.length <= 64) publicResult = Object.freeze({ records: Object.freeze(result.records.map((record) => validRecord(record))) });
+				else if (Object.keys(result).length === 2 && Array.isArray(result.records) && result.records.length <= PAGE_RECORDS && (result.cursor === null || validPageCursor(result.cursor))) publicResult = Object.freeze({ records: Object.freeze(result.records.map((record) => validRecord(record))), cursor: result.cursor });
 				else throw new Error();
 			} catch { throw safeError("invalid Windows transport frame"); }
 		}
@@ -671,7 +679,43 @@ export class WindowsSessionPresenceRegistry {
 	presencePath(_record: PresenceRecord) { throw new SessionPresenceError("unsafe_path", "unsafe transport path"); }
 	async publish(record: PresenceRecord) { try { await this.host.request("publish", { record: validRecord(record as unknown as Record<string, unknown>) }); } catch { registryError(undefined); } }
 	async list(excludeSessionId?: string): Promise<readonly SessionPresenceCandidate[]> { return (await this.listActivations(excludeSessionId)).map((record) => Object.freeze({ sessionId: record.sessionId, reachability: "unknown" as const })); }
-	async listActivations(excludeSessionId?: string): Promise<readonly WindowsRecord[]> { try { const value = await this.host.request("list", { ...(excludeSessionId === undefined ? {} : { excludeSessionId }) }); if (!Array.isArray(value.records) || value.records.length > 64) throw new Error(); return Object.freeze(value.records.map((record) => validRecord(record))); } catch { registryError(undefined); } }
+	async listActivations(excludeSessionId?: string): Promise<readonly WindowsRecord[]> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			if (excludeSessionId !== undefined && (typeof excludeSessionId !== "string" || !SESSION.test(excludeSessionId))) throw new Error();
+			const started = Date.now();
+			const deadline = new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(safeError("Windows presence collection timed out")), RPC_DEADLINE_MS); });
+			const records: WindowsRecord[] = [];
+			const seen = new Set<string>();
+			let cursor: string | null = null;
+			let bytes = 0;
+			for (let page = 0; page < MAX_LIST_PAGES; page++) {
+				if (Date.now() - started >= RPC_DEADLINE_MS) throw new Error();
+				const value = await Promise.race([this.host.request("list-page", { cursor, ...(excludeSessionId === undefined ? {} : { excludeSessionId }) }), deadline]);
+				// The shared decoder also admits legacy replies; they cannot terminate this RPC.
+				if (Date.now() - started >= RPC_DEADLINE_MS || Object.keys(value).length !== 2 || !Array.isArray(value.records) || value.records.length > PAGE_RECORDS || !(value.cursor === null || validPageCursor(value.cursor))) throw new Error();
+				const nextCursor = value.cursor as string | null; // Established by the exact page guard above.
+				if (value.records.length === 0 && (cursor !== null || nextCursor !== null)) throw new Error();
+				for (const candidate of value.records) {
+					const record = validRecord(candidate);
+					// Snapshots already contain ordinal, unique winners. Reject duplicates or
+					// regressions, rather than silently hiding missing/repeated peer pages.
+					if (record.sessionId === excludeSessionId || (records.length > 0 && records[records.length - 1].sessionId >= record.sessionId)) throw new Error();
+					// validRecord constructs the exact RecordText field order; input key order,
+					// whitespace and escape spelling must not change the helper payload budget.
+					bytes += Buffer.byteLength(JSON.stringify(record), "utf8");
+					if (records.length >= MAX_SNAPSHOT_RECORDS || bytes > MAX_SNAPSHOT_BYTES) throw new Error();
+					records.push(record);
+				}
+				if (nextCursor === null) return Object.freeze(records);
+				if (seen.has(nextCursor) || records.length >= MAX_SNAPSHOT_RECORDS) throw new Error();
+				seen.add(nextCursor);
+				cursor = nextCursor;
+			}
+			throw new Error();
+		} catch { registryError(undefined); }
+		finally { if (timer !== undefined) clearTimeout(timer); }
+	}
 	async resolve(sessionId: string): Promise<WindowsRecord> { try { return validRecord(await this.host.request("resolve", { sessionId })); } catch { registryError(undefined); } }
 	async removeOwn(record: PresenceRecord) { try { await this.host.request("remove", { record: validRecord(record as unknown as Record<string, unknown>) }); } catch { /* identity-bound owned cleanup is intentionally best effort */ } }
 	async startListener(sessionId: string): Promise<WindowsRecord> {

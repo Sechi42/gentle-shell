@@ -1094,6 +1094,39 @@ test("Windows-native presence publishes, resolves, lists, and removes only its o
 	} finally { await held.closeInput(); }
 });
 
+test("Windows-native paginated presence returns 90 public peers and resolves beyond page one", { skip: process.platform !== "win32", timeout: 30_000 }, async () => {
+	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-pagination-client-"));
+	const agentHome = join(root, "profile", "agent");
+	await mkdir(join(agentHome, "gentle-agents"), { recursive: true });
+	const registry = await WindowsSessionPresenceRegistry.create(agentHome);
+	let publisher: WindowsSessionPresenceRegistry | undefined;
+	const records = [];
+	try {
+		publisher = await WindowsSessionPresenceRegistry.create(agentHome);
+		for (let i = 0; i < 90; i++) {
+			const owner = i < 45 ? registry : publisher; // Keep each owner's 64-publication cap.
+			const record = await owner.record(`peer-${String(i).padStart(3, "0")}`, i);
+			await owner.publish(record);
+			records.push(record);
+		}
+		assert.deepEqual(await registry.listActivations(), records);
+		assert.deepEqual(await registry.list(), records.map(({ sessionId }) => ({ sessionId, reachability: "unknown" })));
+		assert.deepEqual(await registry.resolve("peer-089"), records[89]);
+		assert.deepEqual(await registry.listActivations("peer-040"), records.filter(({ sessionId }) => sessionId !== "peer-040"));
+		await assert.rejects(registry.list(""), { code: "io_error" });
+		await assert.rejects(registry.resolve("missing"), { code: "io_error" });
+		assert.deepEqual(await registry.listActivations(), records, "rejected inputs preserve every published peer");
+		// Same-session winners retain timestamp then ordinal-token tie breaking.
+		const newer = await registry.record("peer-089", 100);
+		await registry.publish(newer);
+		const tie = await registry.record("peer-089", 100);
+		await registry.publish(tie);
+		const winner = newer.endpoint > tie.endpoint ? newer : tie;
+		assert.deepEqual(await registry.resolve("peer-089"), winner);
+		assert.deepEqual((await registry.listActivations()).at(-1), winner);
+	} finally { try { await publisher?.close(); } finally { await registry.close(); } }
+});
+
 test("Windows-native owned publication removes its unchanged rooted record", { skip: process.platform !== "win32", timeout: 30_000 }, async (t) => {
 	const diagnostics: BootstrapDiagnosticContext = t;
 	const root = await mkdtemp(join(os.tmpdir(), "gentle-pi-presence-"));

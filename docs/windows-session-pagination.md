@@ -1,8 +1,9 @@
-# Bounded helper presence pages
+# Complete bounded Windows peer discovery
 
-The helper adds `list-page`; existing `list` retains its 64-directory-entry limit.
-This is the helper slice only. The Node client does not yet collect pages (T2).
-No records are deleted or classified as stale by discovery.
+The Windows client collects `list-page` results until completion, returning every
+accepted peer or an I/O error, never a partial list. Existing helper `list` retains
+its 64-directory-entry limit for older clients. Discovery neither deletes records
+nor classifies them as stale.
 
 ## Contract
 
@@ -15,7 +16,8 @@ exactly `version`, `sessionId`, `endpoint`, `createdAt`.
 Continue with the returned cursor until it is null. Cursors are opaque,
 helper-local, sequential and single-use. Unknown, malformed, expired, replayed,
 other-helper or exclusion-mismatched cursors return `invalid`, with no record data.
-A lost cursor cannot be resumed: start a new snapshot. Schema violations follow
+A lost cursor cannot be resumed. A caller may explicitly make a new list call;
+the client never automatically retries, restarts a snapshot, or falls back to `list`. Schema violations follow
 existing recognized-operation behavior: `invalid`, then close the request loop.
 Old helpers reject the new operation; clients must not downgrade on failure.
 
@@ -43,7 +45,40 @@ pages come only from the retained record array: later mutation cannot change it.
 A fresh call rescans. Completed/expired snapshots and shutdown release retained
 arrays; expiry sweep may retain an inaccessible expired array for one extra sweep.
 
+## Client collection
+
+Public `listActivations` and `list` preserve their record/candidate output shapes
+and exclusion behavior, including small lists. Each page carries the identical
+exclusion. `resolve` uses the helper's complete bounded scan, not the first page.
+
+The decoder adds only the exact `{records,cursor}` shape (at most 32 validated
+records, null or 32 lowercase hexadecimal cursor); legacy frame parsing and the
+16,384-byte control limit are unchanged. The collector separately requires a page
+reply, so a legacy records-only reply cannot masquerade as successful completion.
+New clients fail closed against old helpers; old clients can still use the new
+helper's small legacy lists.
+
+Collection accepts at most 4,096 records, 524,288 canonical `RecordText` UTF-8
+record bytes, and 128 sequential page requests. The helper marks its last nonempty
+page terminal, so no extra empty terminal request is needed (only an initially
+empty snapshot may return an empty page). A single 2,000-ms cooperative client
+budget covers all requests and validation, without extending helper cursor expiry.
+Checks plus a collection timer bound async waiting, not stalled synchronous OS I/O
+or event-loop execution; this is not an OS-level hard deadline.
+
+Pages must retain strictly increasing ordinal session IDs: the helper already
+selects newest timestamp/greatest token winners. Duplicate or regressive records,
+excluded peers, repeated cursors, empty continuations, malformed replies, helper
+rejection and expiry all fail closed, with no partial public output or retry.
+
 ## Verification boundary
+
+`tests/windows-session-pagination-client.test.ts` exercises the real host decoder
+with a fake child, covering public aggregation, exact limits, refusal/call counts,
+and a controlled clock. The selected `Windows-native paginated presence` bootstrap
+case uses a fresh temporary profile and public registry calls for 90 peers,
+exclusion, beyond-page-one resolve and winner semantics; it never accesses HKCU.
+
 
 `tests/windows-session-pagination.test.ps1` uses only a GUID-owned disposable
 profile, explicit private file ACLs, bounded waits and owned-file cleanup. Run it
