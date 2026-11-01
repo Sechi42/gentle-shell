@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtemp, mkdir, readFile, stat } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readFile, realpath, rmdir, stat, unlink } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import os from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, parse, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -1105,6 +1105,80 @@ test("Windows-native presence publishes, resolves, lists, and removes only its o
 	} finally {
 		await held.closeInput();
 		await Promise.all(pipes.map((pipe) => new Promise<void>((resolve) => pipe.close(() => resolve()))));
+	}
+});
+
+test("Windows-native paginated presence returns 90 peers and reclaims an absent orphan", { skip: process.platform !== "win32", timeout: 60_000 }, async (t) => {
+	// The dedicated child temp path must contain no reparse points. Never resolve
+	// a fixture through a junction or clean anything outside the exclusively made root.
+	const temp = resolve(os.tmpdir());
+	for (let current = temp; ; current = dirname(current)) {
+		assert.equal((await lstat(current)).isSymbolicLink(), false, "temporary ancestor is a link");
+		if (current === parse(current).root) break;
+	}
+	assert.equal((await realpath(temp)).toLowerCase(), temp.toLowerCase());
+	const root = await mkdtemp(join(temp, "gp-page-"));
+	const routing = join(root, "gentle-agents");
+	const transport = join(routing, "transport");
+	const presence = join(transport, "presence");
+	const pipes: ReturnType<typeof createServer>[] = [];
+	let registry: WindowsSessionPresenceRegistry | undefined;
+	let publisher: WindowsSessionPresenceRegistry | undefined;
+	let orphan: InitializedHelper | undefined;
+	let orphanPath: string | undefined;
+	try {
+		await mkdir(routing);
+		registry = await WindowsSessionPresenceRegistry.create(root);
+		publisher = await WindowsSessionPresenceRegistry.create(root);
+		const records = [];
+		for (let i = 0; i < 90; i++) {
+			const owner = i < 45 ? registry : publisher;
+			const record = await owner.record(`peer-${String(i).padStart(3, "0")}`, i);
+			const pipe = createServer((socket) => socket.destroy());
+			pipes.push(pipe);
+			await new Promise<void>((ok, fail) => { pipe.once("error", fail); pipe.listen(record.endpoint, ok); });
+			await owner.publish(record);
+			records.push(record);
+		}
+		assert.deepEqual(await registry.listActivations(), records);
+		assert.deepEqual(await registry.list(), records.map(({ sessionId }) => ({ sessionId, reachability: "unknown" })));
+		assert.deepEqual(await registry.resolve("peer-089"), records[89]);
+		assert.deepEqual(await registry.listActivations("peer-040"), records.filter(({ sessionId }) => sessionId !== "peer-040"));
+		await assert.rejects(registry.list(""), { code: "io_error" });
+		await assert.rejects(registry.resolve("missing"), { code: "io_error" });
+		const newer = await registry.record("peer-089", 100);
+		const tie = await registry.record("peer-089", 100);
+		for (const record of [newer, tie]) {
+			const pipe = createServer((socket) => socket.destroy()); pipes.push(pipe);
+			await new Promise<void>((ok, fail) => { pipe.once("error", fail); pipe.listen(record.endpoint, ok); });
+			await registry.publish(record);
+		}
+		const winner = newer.endpoint > tie.endpoint ? newer : tie;
+		assert.deepEqual(await registry.resolve("peer-089"), winner);
+		assert.deepEqual((await registry.listActivations()).at(-1), winner);
+		orphan = await openInitializedHelper(root, { diagnostics: t });
+		const stale = requirePublicPresenceResult(await orphan.presence("listen", { sessionId: "orphan", createdAt: 1 })) as { endpoint: string };
+		orphanPath = join(presence, `orphan.${stale.endpoint.slice("\\\\.\\pipe\\gentle-pi-".length)}.json`);
+		assert.notEqual(await orphan.terminate(), 0);
+		assert.equal(await probeWindowsNativeEndpoint(stale.endpoint), "ENOENT");
+		await stat(orphanPath);
+		assert.deepEqual(await registry.listActivations(), [...records.slice(0, 89), winner]);
+		await assert.rejects(stat(orphanPath), { code: "ENOENT" }, "complete paginated scan reclaims the orphan");
+	} finally {
+		try { await orphan?.closeInput(); }
+		finally {
+			try { await Promise.all(pipes.filter((pipe) => pipe.listening).map((pipe) => new Promise<void>((ok, fail) => pipe.close((error) => error ? fail(error) : ok())))); }
+			finally {
+				try { await publisher?.close(); }
+				finally {
+					await registry?.close();
+					if (orphanPath) { try { await unlink(orphanPath); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; } }
+					for (const directory of [presence, transport, routing, root]) {
+						try { await rmdir(directory); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+					}
+				}
+			}
+		}
 	}
 });
 

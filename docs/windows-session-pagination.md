@@ -1,7 +1,5 @@
 # Complete bounded Windows peer discovery
 
-> Helper review slice: the helper RPCs and native fixture are implemented here. The client collector and public 90-peer integration described below belong to the dependent client slice; the observed local results describe the combined candidate.
-
 The Windows client collects `list-page` results until completion, returning every accepted peer or an I/O error, never a partial list. Existing helper `list` retains its 64-directory-entry limit for older clients.
 
 ## Contract
